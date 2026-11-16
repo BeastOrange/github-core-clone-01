@@ -177,6 +177,7 @@ export function tryMerge(store: Store, repo: Repo, pr: PullRequest): MergeOutcom
   const message = `Merge pull request #${pr.number} from ${pr.headRef}\n\n${pr.title}\n`;
   const sha = store.putObject('commit', buildCommit(tree, [baseTip], message, ts));
   repo.refs.set(`refs/heads/${pr.baseRef}`, sha);
+  store.touchRefs(repo);
   pr.state = 'closed';
   pr.merged = true;
   pr.merged_at = nowIso();
@@ -215,6 +216,25 @@ function refTip(store: Store, repo: Repo, ref: string | null): string | undefine
   return undefined;
 }
 
+function commitView(store: Store, sha: string): Record<string, unknown> | null {
+  const obj = store.getObject(store.peel(sha));
+  if (!obj || obj.type !== 'commit') return null;
+  const v = parseCommit(obj.data);
+  const peeled = store.peel(sha);
+  return {
+    sha: peeled,
+    commit: {
+      // The raw commit object ends its message with "\n"; the API
+      // reports the message without that trailing newline.
+      message: v.message.replace(/\n+$/, ''),
+      author: { name: v.author, date: nowIso() },
+      committer: { name: v.committer, date: nowIso() },
+    },
+    author: { login: VIEWER.login },
+    parents: v.parents.map((p) => ({ sha: p })),
+  };
+}
+
 // ---------------------------------------------------------------- handlers
 
 export function handleRest(method: string, segments: string[], ctx: Ctx): Reply | null {
@@ -226,6 +246,14 @@ export function handleRest(method: string, segments: string[], ctx: Ctx): Reply 
   }
   if (segments.length === 1 && a === 'meta') {
     if (method === 'GET') return ok({ installed_version: '1.0.0', github_services_sha: 'forge' });
+    return null;
+  }
+  if (segments.length === 1 && a === 'rate_limit') {
+    if (method === 'GET') {
+      const reset = Math.floor(Date.now() / 1000) + 3600;
+      const core = { limit: 5000, remaining: 4999, reset, used: 1 };
+      return ok({ resources: { core, search: { limit: 30, remaining: 30, reset, used: 0 }, graphql: { limit: 5000, remaining: 4999, reset, used: 1 } }, rate: core });
+    }
     return null;
   }
   if (segments.length === 1 && a === 'user' && method === 'GET') {
@@ -260,7 +288,9 @@ export function handleRest(method: string, segments: string[], ctx: Ctx): Reply 
     if (method === 'PATCH') {
       if (!isRecord(ctx.body)) return err(400, 'Invalid request body');
       if (typeof ctx.body.description === 'string') repo.description = ctx.body.description;
-      if (typeof ctx.body.default_branch === 'string' && repo.refs.has(`refs/heads/${ctx.body.default_branch}`)) repo.defaultBranch = ctx.body.default_branch;
+      if (typeof ctx.body.default_branch === 'string' && repo.refs.has(`refs/heads/${ctx.body.default_branch}`)) {
+        if (ctx.body.default_branch !== repo.defaultBranch) { repo.defaultBranch = ctx.body.default_branch; ctx.store.touchRefs(repo); }
+      }
       return ok(repoView(repo));
     }
     if (method === 'DELETE') {
@@ -301,22 +331,26 @@ export function handleRest(method: string, segments: string[], ctx: Ctx): Reply 
         const obj = ctx.store.getObject(cur);
         if (!obj || obj.type !== 'commit') continue;
         const v = parseCommit(obj.data);
-        out.push({
-          sha: cur,
-          commit: {
-            // The raw commit object ends its message with "\n"; the API
-            // reports the message without that trailing newline.
-            message: v.message.replace(/\n+$/, ''),
-            author: { name: v.author, date: nowIso() },
-            committer: { name: v.committer, date: nowIso() },
-          },
-          author: { login: VIEWER.login },
-          parents: v.parents.map((p) => ({ sha: p })),
-        });
+        const view = commitView(ctx.store, cur);
+        if (view) out.push(view);
         for (const p of v.parents) queue.push(p);
       }
     }
     return ok(out);
+  }
+
+  if (rest[0] === 'commits' && rest.length === 2 && method === 'GET') {
+    // One commit, by full oid, tag, branch name, or a unique short prefix.
+    const ref = decodeURIComponent(rest[1]);
+    let sha = refTip(ctx.store, repo, ref);
+    if (!sha && /^[0-9a-f]{7,39}$/.test(ref)) {
+      const matches = [...ctx.store.objects.keys()].filter((oid) => oid.startsWith(ref) && ctx.store.getObject(oid)?.type === 'commit');
+      if (matches.length === 1) sha = matches[0];
+    }
+    if (!sha) return err(404, 'Not Found');
+    const view = commitView(ctx.store, sha);
+    if (!view) return err(404, 'Not Found');
+    return ok(view);
   }
 
   if (rest[0] === 'git' && rest[1] === 'refs') {
@@ -329,15 +363,33 @@ export function handleRest(method: string, segments: string[], ctx: Ctx): Reply 
       const obj = ctx.store.getObject(sha);
       if (!obj) return err(422, 'Object does not exist');
       repo.refs.set(ref, sha);
+      ctx.store.touchRefs(repo);
       return ok({ ref, object: { sha, type: obj.type }, url: '' }, 201);
     }
-    if (method === 'GET' && rest.length === 4 && rest[2] === 'heads') {
-      const branch = decodeURIComponent(rest[3]);
-      const sha = repo.refs.get(`refs/heads/${branch}`);
+    if (method === 'GET' && rest.length === 2) {
+      // List every ref in the repository (heads, tags and HEAD's target).
+      return ok([...repo.refs.keys()].sort().map((ref) => ({ ref, object: { sha: repo.refs.get(ref)!, type: ctx.store.getObject(repo.refs.get(ref)!)?.type ?? 'commit' } })));
+    }
+    if (method === 'GET' && rest.length === 4 && (rest[2] === 'heads' || rest[2] === 'tags')) {
+      const name = decodeURIComponent(rest[3]);
+      const sha = repo.refs.get(`refs/${rest[2]}/${name}`);
       if (!sha) return err(404, 'Reference not found');
-      return ok({ ref: `refs/heads/${branch}`, object: { sha, type: 'commit' } });
+      return ok({ ref: `refs/${rest[2]}/${name}`, object: { sha, type: ctx.store.getObject(sha)?.type ?? 'commit' } });
     }
     return null;
+  }
+
+  if (rest[0] === 'readme' && rest.length === 1 && method === 'GET') {
+    // The repository's README at the default branch (or ?ref=), as a contents file view.
+    const ref = ctx.query.get('ref');
+    const tip = refTip(ctx.store, repo, ref);
+    if (!tip) return err(404, 'Not Found');
+    const flat = ctx.store.treeFlat(tip);
+    const name = [...flat.keys()].find((p) => /^readme(\.[a-z0-9]+)?$/i.test(p.split('/').pop() ?? ''));
+    if (!name) return err(404, 'Not Found');
+    const oid = flat.get(name)!;
+    const obj = ctx.store.getObject(oid)!;
+    return ok({ type: 'file', encoding: 'base64', size: obj.data.length, name: name.split('/').pop(), path: name, content: obj.data.toString('base64'), sha: oid });
   }
 
   if (rest[0] === 'contents') {

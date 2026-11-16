@@ -117,6 +117,8 @@ export interface PullRequest {
 export interface Repo {
   owner: string; name: string; description: string; isPrivate: boolean;
   defaultBranch: string; id: number; seq: number;
+  /** Bumped on every ref or default-branch change: caches keyed on it stay exact. */
+  refsVersion: number;
   refs: Map<string, string>;
   labels: Map<string, { name: string; color: string }>;
   issues: Map<number, Issue>;
@@ -139,6 +141,17 @@ export class Store {
     return oid;
   }
 
+  /**
+   * Store an object whose oid was already computed (and verified) by the
+   * pack reader, so a receive-pack does not hash every object twice.
+   */
+  putObjectKnown(oid: string, type: GitObjectType, data: Buffer): void {
+    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+  }
+
+  /** Bump a repo's refs version after any ref or default-branch change. */
+  touchRefs(repo: Repo): void { repo.refsVersion += 1; }
+
   getObject(oid: string): GitObject | undefined { return this.objects.get(oid); }
 
   key(owner: string, name: string): string { return `${owner}/${name}`; }
@@ -148,7 +161,7 @@ export class Store {
   createRepo(owner: string, name: string, isPrivate: boolean, description: string): Repo {
     const repo: Repo = {
       owner, name, description, isPrivate, defaultBranch: 'main',
-      id: this.nextRepoId, seq: this.nextSeq(),
+      id: this.nextRepoId, seq: this.nextSeq(), refsVersion: 0,
       refs: new Map(), labels: new Map(), issues: new Map(), pulls: new Map(), nextNumber: 1,
     };
     this.nextRepoId += 1;
@@ -303,6 +316,7 @@ export class Store {
     const ts = Math.floor(Date.now() / 1000);
     const commit = this.putObject('commit', buildCommit(tree, tip ? [tip] : [], message.endsWith('\n') ? message : `${message}\n`, ts));
     repo.refs.set(`refs/heads/${branch}`, commit);
+    this.touchRefs(repo);
     return commit;
   }
 }

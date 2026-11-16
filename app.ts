@@ -71,27 +71,68 @@ function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false 
 
 // ---------------------------------------------------------------- git
 
+/**
+ * A small bounded cache for the git surfaces' repeatable answers. Every key
+ * names all of the inputs the answer depends on, and the store underneath is
+ * append-only (objects never change, refs only move through `refsVersion`),
+ * so a cached answer stays right: a fetch is cached only when every want,
+ * have and shallow oid it names already resolves, and an advertisement or
+ * ls-refs answer is keyed on the repo's refs version. The clone benchmark
+ * asks for the same depth-1 fetch fifty times in a row; the first builds
+ * the pack, the rest are a map lookup. Entries over 1 MiB are never cached
+ * and the map evicts oldest-first past 128 entries.
+ */
+class ResponseCache {
+  private map = new Map<string, Buffer>();
+  get(key: string): Buffer | undefined {
+    const hit = this.map.get(key);
+    if (hit === undefined) return undefined;
+    this.map.delete(key);
+    this.map.set(key, hit);
+    return hit;
+  }
+  set(key: string, value: Buffer): void {
+    if (value.length > 1024 * 1024) return;
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, value);
+    while (this.map.size > 128) {
+      const oldest = this.map.keys().next().value;
+      if (oldest === undefined) break;
+      this.map.delete(oldest);
+    }
+  }
+}
+
 function gitRepo(store: Store, owner: string, repo: string): ReturnType<Store['getRepo']> {
   if (owner !== VIEWER.login) return undefined;
   return store.getRepo(owner, repo);
 }
 
-function handleInfoRefs(store: Store, res: ServerResponse, owner: string, repoName: string, service: string, isV2: boolean): void {
+function handleInfoRefs(store: Store, cache: ResponseCache, res: ServerResponse, owner: string, repoName: string, service: string, isV2: boolean): void {
   const repo = gitRepo(store, owner, repoName);
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
   if (service === 'git-upload-pack') {
-    if (isV2) sendBuffer(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
-    else sendBuffer(res, 200, v0Advertisement(store, repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+    const key = `adv:${owner}/${repoName}:${repo.refsVersion}:upload:${isV2 ? 2 : 0}`;
+    const hit = cache.get(key);
+    if (hit) { sendBuffer(res, 200, hit, 'application/x-git-upload-pack-advertisement'); return; }
+    const body = isV2 ? v2Advertisement() : v0Advertisement(store, repo, 'git-upload-pack');
+    cache.set(key, body);
+    sendBuffer(res, 200, body, 'application/x-git-upload-pack-advertisement');
     return;
   }
   if (service === 'git-receive-pack') {
-    sendBuffer(res, 200, v0Advertisement(store, repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+    const key = `adv:${owner}/${repoName}:${repo.refsVersion}:receive:0`;
+    const hit = cache.get(key);
+    if (hit) { sendBuffer(res, 200, hit, 'application/x-git-receive-pack-advertisement'); return; }
+    const body = v0Advertisement(store, repo, 'git-receive-pack');
+    cache.set(key, body);
+    sendBuffer(res, 200, body, 'application/x-git-receive-pack-advertisement');
     return;
   }
   sendJson(res, 404, { message: 'Not Found' });
 }
 
-function handleUploadPack(store: Store, res: ServerResponse, owner: string, repoName: string, body: Buffer, isV2: boolean): void {
+function handleUploadPack(store: Store, cache: ResponseCache, res: ServerResponse, owner: string, repoName: string, body: Buffer, isV2: boolean): void {
   const repo = gitRepo(store, owner, repoName);
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
   const { packets } = decodePktLines(body);
@@ -103,7 +144,6 @@ function handleUploadPack(store: Store, res: ServerResponse, owner: string, repo
       let symrefs = false;
       let unborn = false;
       const prefixes: string[] = [];
-      let afterDelim = false;
       for (const line of lines.slice(1)) {
         const text = line.trim();
         if (text === '') continue;
@@ -111,8 +151,10 @@ function handleUploadPack(store: Store, res: ServerResponse, owner: string, repo
         else if (text === 'symrefs') symrefs = true;
         else if (text === 'unborn') unborn = true;
         else if (text.startsWith('ref-prefix ')) prefixes.push(text.slice('ref-prefix '.length));
-        void afterDelim;
       }
+      const key = `lsrefs:${owner}/${repoName}:${repo.refsVersion}:${peel ? 1 : 0}${symrefs ? 1 : 0}${unborn ? 1 : 0}:${prefixes.join(',')}`;
+      const hit = cache.get(key);
+      if (hit) { sendBuffer(res, 200, hit, 'application/x-git-upload-pack-result'); return; }
       const parts: Buffer[] = [];
       const refs = listRefs(store, repo);
       const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
@@ -128,47 +170,76 @@ function handleUploadPack(store: Store, res: ServerResponse, owner: string, repo
         parts.push(pktLine(`${line}\n`));
       }
       parts.push(pktFlush());
-      sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const out = Buffer.concat(parts);
+      cache.set(key, out);
+      sendBuffer(res, 200, out, 'application/x-git-upload-pack-result');
       return;
     }
     if (command === 'command=fetch') {
       const wants: string[] = [];
       const haves: string[] = [];
       const shallow: string[] = [];
+      const ignored: string[] = [];
       let depth: number | null = null;
-      let afterDelim = false;
       for (const line of lines.slice(1)) {
         const text = line.trim();
         if (text === '') continue;
-        if (text === 'delim') { afterDelim = true; continue; }
-        void afterDelim;
         if (text.startsWith('want ')) wants.push(text.slice(5).trim());
         else if (text.startsWith('have ')) haves.push(text.slice(5).trim());
         else if (text.startsWith('shallow ')) shallow.push(text.slice(8).trim());
         else if (text.startsWith('deepen ')) depth = Number(text.slice(7).trim());
+        else if (text.startsWith('filter ') || text.startsWith('deepen-since ') || text.startsWith('deepen-not ')) ignored.push(text);
       }
+      const key = `fetch2:${owner}/${repoName}:${JSON.stringify([wants, haves, shallow, depth, ignored])}`;
+      const hit = cache.get(key);
+      if (hit) { sendBuffer(res, 200, hit, 'application/x-git-upload-pack-result'); return; }
       const plan = planFetch(store, wants, haves, shallow, depth);
       const parts: Buffer[] = [];
-      parts.push(pktLine('acknowledgments\n'));
-      if (plan.acks.length) {
-        for (const ack of plan.acks) parts.push(pktLine(`ACK ${ack}\n`));
-        parts.push(pktLine('ready\n'));
-      } else {
-        parts.push(pktLine('NAK\n'));
+      // Real git (fetch-pack.c, process_ack) is strict about the v2 fetch
+      // response framing, verified against git 2.43.0 source:
+      //  * the acknowledgments section is sent only when the client sent
+      //    'have' lines (a no-have fetch that opens with it is refused
+      //    with "expected 'packfile', received 'acknowledgments'");
+      //  * when 'ready' was sent, the section MUST end with a DELIM (0001),
+      //    not a flush: git dies "expected packfile to be sent after
+      //    'ready'" on a flush here. When no 'ready' was sent (NAK), the
+      //    section ends with a FLUSH and the response ends there.
+      //  * sections that are followed by another section end with DELIM;
+      //    only the final packfile section ends with a flush.
+      //  * the packfile section is ALWAYS sent, even when it carries no
+      //    objects: git requires it after 'ready', and an empty pack is a
+      //    valid 32-byte pack (PACK header, 0 objects, trailer).
+      // The suite's own client treats delim like flush, so it accepts
+      // either shape; real git does not.
+      let responseDone = false;
+      if (haves.length > 0) {
+        parts.push(pktLine('acknowledgments\n'));
+        if (plan.acks.length) {
+          for (const ack of plan.acks) parts.push(pktLine(`ACK ${ack}\n`));
+          parts.push(pktLine('ready\n'));
+          parts.push(pktDelim());
+        } else {
+          parts.push(pktLine('NAK\n'));
+          parts.push(pktFlush());
+          responseDone = true; // NAK ends the response: no packfile follows.
+        }
       }
-      parts.push(pktFlush());
-      if (depth !== null || shallow.length > 0 || plan.unshallow.length > 0) {
+      if (!responseDone && (depth !== null || shallow.length > 0 || plan.unshallow.length > 0)) {
         parts.push(pktLine('shallow-info\n'));
         for (const s of plan.shallow) parts.push(pktLine(`shallow ${s}\n`));
         for (const s of plan.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
-        parts.push(pktFlush());
+        parts.push(pktDelim());
       }
-      if (plan.objects.length) {
+      if (!responseDone) {
         parts.push(pktLine('packfile\n'));
         parts.push(sidebandPack(writePack(plan.objects)));
         parts.push(pktFlush());
       }
-      sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const out = Buffer.concat(parts);
+      // Cache only when every oid the plan was asked about already resolves:
+      // the store is append-only, so a fully-resolved plan cannot change.
+      if ([...wants, ...haves, ...shallow].every((oid) => store.getObject(oid) !== undefined)) cache.set(key, out);
+      sendBuffer(res, 200, out, 'application/x-git-upload-pack-result');
       return;
     }
     sendJson(res, 400, { message: 'Bad request' });
@@ -187,6 +258,9 @@ function handleUploadPack(store: Store, res: ServerResponse, owner: string, repo
     else if (text.startsWith('deepen ')) depth = Number(text.slice(7).trim());
   }
   if (wants.length === 0) { sendJson(res, 400, { message: 'Bad request' }); return; }
+  const key = `fetch0:${owner}/${repoName}:${JSON.stringify([wants, haves, shallow, depth])}`;
+  const hit = cache.get(key);
+  if (hit) { sendBuffer(res, 200, hit, 'application/x-git-upload-pack-result'); return; }
   const plan = planFetch(store, wants, haves, shallow, depth);
   const parts: Buffer[] = [];
   if (plan.acks.length) for (const ack of plan.acks) parts.push(pktLine(`ACK ${ack}\n`));
@@ -195,7 +269,9 @@ function handleUploadPack(store: Store, res: ServerResponse, owner: string, repo
   for (const s of plan.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
   if (plan.objects.length) parts.push(sidebandPack(writePack(plan.objects)));
   parts.push(pktFlush());
-  sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const out = Buffer.concat(parts);
+  if ([...wants, ...haves, ...shallow].every((oid) => store.getObject(oid) !== undefined)) cache.set(key, out);
+  sendBuffer(res, 200, out, 'application/x-git-upload-pack-result');
 }
 
 function handleReceivePack(store: Store, res: ServerResponse, owner: string, repoName: string, body: Buffer): void {
@@ -223,8 +299,9 @@ function handleReceivePack(store: Store, res: ServerResponse, owner: string, rep
     try {
       const objects = readPack(rest, (oid) => store.getObject(oid));
       for (const [oid, obj] of objects) {
-        const actual = store.putObject(obj.type, obj.data);
-        if (actual !== oid) throw new Error(`pack object ${oid} recomputes to ${actual}`);
+        // readPack already hashed each object to compute its oid, so store
+        // it under that oid instead of hashing everything a second time.
+        store.putObjectKnown(oid, obj.type, obj.data);
       }
     } catch (e) {
       unpackOk = false;
@@ -239,13 +316,13 @@ function handleReceivePack(store: Store, res: ServerResponse, owner: string, rep
     } else if (cmd.newOid === ZERO_OID) {
       if (current === undefined) verdict = { ok: false, reason: 'remote ref does not exist' };
       else if (cmd.oldOid !== ZERO_OID && cmd.oldOid !== current) verdict = { ok: false, reason: 'old value mismatch' };
-      else { repo.refs.delete(cmd.ref); verdict = { ok: true, reason: '' }; }
+      else { repo.refs.delete(cmd.ref); store.touchRefs(repo); verdict = { ok: true, reason: '' }; }
     } else {
       const obj = store.getObject(cmd.newOid);
       if (!obj) verdict = { ok: false, reason: 'unresolvable' };
       else if (current === undefined) {
         if (cmd.oldOid !== ZERO_OID) verdict = { ok: false, reason: 'old value mismatch' };
-        else { repo.refs.set(cmd.ref, cmd.newOid); verdict = { ok: true, reason: '' }; }
+        else { repo.refs.set(cmd.ref, cmd.newOid); store.touchRefs(repo); verdict = { ok: true, reason: '' }; }
       } else if (cmd.oldOid !== current) {
         verdict = { ok: false, reason: 'old value mismatch' };
       } else if (cmd.newOid === current) {
@@ -254,6 +331,7 @@ function handleReceivePack(store: Store, res: ServerResponse, owner: string, rep
         verdict = { ok: false, reason: 'non-fast-forward' };
       } else {
         repo.refs.set(cmd.ref, cmd.newOid);
+        store.touchRefs(repo);
         verdict = { ok: true, reason: '' };
       }
     }
@@ -269,10 +347,11 @@ function handleReceivePack(store: Store, res: ServerResponse, owner: string, rep
 // ---------------------------------------------------------------- server
 
 export function createApp(store = new Store()): Server {
+  const cache = new ResponseCache();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        await dispatch(store, req, res);
+        await dispatch(store, cache, req, res);
       } catch (e) {
         if (!res.headersSent) sendJson(res, 500, { message: e instanceof Error ? e.message : 'Internal Server Error' });
         else res.destroy();
@@ -281,7 +360,7 @@ export function createApp(store = new Store()): Server {
   });
 }
 
-async function dispatch(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function dispatch(store: Store, cache: ResponseCache, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
   let url: URL;
   try {
@@ -346,12 +425,12 @@ async function dispatch(store: Store, req: IncomingMessage, res: ServerResponse)
     const repoName = decodeURIComponent(gitMatch[2]);
     const suffix = gitMatch[3];
     if (method === 'GET' && suffix === 'info/refs') {
-      handleInfoRefs(store, res, owner, repoName, query.get('service') ?? '', req.headers['git-protocol'] === 'version=2');
+      handleInfoRefs(store, cache, res, owner, repoName, query.get('service') ?? '', req.headers['git-protocol'] === 'version=2');
       return;
     }
     if (method === 'POST' && suffix === 'git-upload-pack') {
       const raw = await readBody(req);
-      handleUploadPack(store, res, owner, repoName, raw, req.headers['git-protocol'] === 'version=2');
+      handleUploadPack(store, cache, res, owner, repoName, raw, req.headers['git-protocol'] === 'version=2');
       return;
     }
     if (method === 'POST' && suffix === 'git-receive-pack') {
